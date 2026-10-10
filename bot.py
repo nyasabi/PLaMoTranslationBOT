@@ -29,7 +29,7 @@ PLAMO_ENDPOINT = "https://api.platform.preferredai.jp/v1/chat/completions"
 PLAMO_MODEL = "plamo-3.0-prime"
 
 # 起動ログに表示。新しいコードが動いているかの確認用
-BOT_VERSION = "4 (admin-only commands, per-server ban)"
+BOT_VERSION = "5 (help, except-channels)"
 
 # max_tokens 未指定だと 20480 が入り、入力+max_tokens がコンテキスト長を
 # 超えるとエラーになるため、明示的に指定する
@@ -129,6 +129,34 @@ def save_banned() -> None:
 
 
 banned_users: dict[int, set[int]] = load_banned()
+
+
+# 例外チャンネル（サーバーごと）。ここでは管理者権限を持つ人だけが翻訳できる
+EXCEPT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "except_channels.json")
+
+
+def load_except() -> dict[int, set[int]]:
+    try:
+        with open(EXCEPT_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {int(g): {int(c) for c in chs} for g, chs in data.items()}
+        return {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        log.exception("except_channels.json の読み込みに失敗しました")
+        return {}
+
+
+def save_except() -> None:
+    tmp = EXCEPT_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({str(g): sorted(c) for g, c in except_channels.items() if c}, f)
+    os.replace(tmp, EXCEPT_FILE)
+
+
+except_channels: dict[int, set[int]] = load_except()
 
 
 class UntranslatedError(Exception):
@@ -352,6 +380,23 @@ async def on_ready():
 
 _ID_PATTERN = re.compile(r"\d{17,20}")
 
+HELP_TEXT = (
+    "📖 **翻訳BOT ヘルプ**\n"
+    "メッセージに国旗の絵文字でリアクションすると、その言語に翻訳して返信します。\n"
+    "（例: 🇺🇸 英語 / 🇰🇷 韓国語 / 🇫🇷 フランス語）\n\n"
+    "**コマンド**\n"
+    "`!help` : このヘルプを表示します。\n\n"
+    "**管理者のみ**\n"
+    "`!ping` : 遅延（ms）を表示します。\n"
+    "`!t-ban @ユーザー` : そのユーザーの翻訳機能を禁止します。\n"
+    "`!t-unban @ユーザー` : 禁止を解除します。\n"
+    "`!t-except add [#チャンネル]` : 例外チャンネルに追加します（省略すると今のチャンネル）。\n"
+    "`!t-except remove [#チャンネル]` : 例外チャンネルから外します。\n"
+    "`!t-except list` : 例外チャンネルの一覧を表示します。\n\n"
+    "例外チャンネルでは、管理者権限を持つ人だけが翻訳できます。"
+)
+
+
 
 @client.event
 async def on_message(message: discord.Message):
@@ -361,8 +406,16 @@ async def on_message(message: discord.Message):
 
     cmd, _, arg = message.content.strip().partition(" ")
     cmd = cmd.lower()
-    if cmd not in ("!ping", "!t-ban", "!t-unban"):
+    if cmd not in ("!help", "!ping", "!t-ban", "!t-unban", "!t-except"):
         return
+
+    # !help は誰でも使える
+    if cmd == "!help":
+        await message.reply(
+            HELP_TEXT, mention_author=False, allowed_mentions=discord.AllowedMentions.none()
+        )
+        return
+
     # 管理者権限を持たない人には何も反応しない
     perms = getattr(message.author, "guild_permissions", None)
     if perms is None or not perms.administrator:
@@ -381,6 +434,45 @@ async def on_message(message: discord.Message):
         await sent.edit(
             content=f"🏓 Pong!\nGateway: **{gateway_ms}**\nAPI: **{api_ms:.0f} ms**"
         )
+        return
+
+    # --- !t-except add / remove / list ---
+    if cmd == "!t-except":
+        no_mentions = discord.AllowedMentions.none()
+        sub, _, rest = arg.strip().partition(" ")
+        sub = sub.lower()
+        channels = except_channels.setdefault(message.guild.id, set())
+
+        if sub == "list":
+            if channels:
+                text = "例外チャンネル（管理者のみ翻訳できます）:\n" + "\n".join(
+                    f"<#{c}>" for c in sorted(channels)
+                )
+            else:
+                text = "例外チャンネルはありません。"
+        elif sub in ("add", "remove"):
+            m = _ID_PATTERN.search(rest)
+            channel_id = int(m.group()) if m else message.channel.id  # 省略時は今のチャンネル
+            if message.guild.get_channel_or_thread(channel_id) is None:
+                text = "このサーバーのチャンネルが見つかりません。"
+            elif sub == "add":
+                if channel_id in channels:
+                    text = f"<#{channel_id}> はすでに例外チャンネルです。"
+                else:
+                    channels.add(channel_id)
+                    save_except()
+                    text = f"🔒 <#{channel_id}> を例外チャンネルにしました。管理者だけが翻訳できます。"
+            else:
+                if channel_id in channels:
+                    channels.discard(channel_id)
+                    save_except()
+                    text = f"🔓 <#{channel_id}> を例外チャンネルから外しました。"
+                else:
+                    text = f"<#{channel_id}> は例外チャンネルではありません。"
+        else:
+            text = "使い方: `!t-except add [#チャンネル]` / `!t-except remove [#チャンネル]` / `!t-except list`"
+
+        await message.reply(text, mention_author=False, allowed_mentions=no_mentions)
         return
 
     # --- !t-ban / !t-unban: メンションまたはユーザーIDを指定 ---
@@ -442,6 +534,25 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     flag = str(payload.emoji)
     if flag not in FLAG_LANGUAGES:
         return
+
+    # 例外チャンネル（スレッドの場合は親チャンネルも対象）では、管理者権限を持つ人だけが翻訳できる
+    if payload.guild_id:
+        restricted = except_channels.get(payload.guild_id, set())
+        if restricted:
+            ch = client.get_channel(payload.channel_id)
+            parent_id = getattr(ch, "parent_id", None)
+            if payload.channel_id in restricted or (parent_id and parent_id in restricted):
+                member = payload.member
+                if member is None:
+                    guild = client.get_guild(payload.guild_id)
+                    try:
+                        member = guild.get_member(payload.user_id) or await guild.fetch_member(
+                            payload.user_id
+                        )
+                    except Exception:
+                        member = None
+                if member is None or not member.guild_permissions.administrator:
+                    return
 
     display_name, language = FLAG_LANGUAGES[flag]
     key = (payload.message_id, language)
